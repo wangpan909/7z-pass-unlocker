@@ -117,7 +117,8 @@ class ZipUnlocker:
     # 核心：尝试一组密码
     # ------------------------------------------------------------------
     def try_passwords(self, passwords: list[str],
-                      progress_cb=None, cancel_event=None) -> dict:
+                      progress_cb=None, cancel_event=None,
+                      overwrite: str = "overwrite") -> dict:
         """
         逐个尝试密码。
 
@@ -159,7 +160,7 @@ class ZipUnlocker:
                 progress_cb(idx + 1, total, pwd, "running", "正在尝试...", 0)
 
             # 执行解压
-            returncode, out_text, err_text = self._run_7z(pwd)
+            returncode, out_text, err_text = self._run_7z(pwd, overwrite=overwrite)
 
             elapsed_ms = int((time.perf_counter() - start) * 1000)
 
@@ -169,6 +170,8 @@ class ZipUnlocker:
                 result["password"] = pwd
                 # 修复因文件名编码导致的乱码（SJIS/GBK 无 UTF-8 标志的 ZIP）
                 self._fix_filename_encoding()
+                # 智能收缩：包内仅一个顶层目录时不再额外套一层（类似 Bandizip 智能解压）
+                self._collapse_single_dir()
                 if progress_cb:
                     progress_cb(idx + 1, total, pwd, "success",
                                 "解压成功！", elapsed_ms)
@@ -188,14 +191,18 @@ class ZipUnlocker:
     # ------------------------------------------------------------------
     # 单次 7z 调用
     # ------------------------------------------------------------------
-    def _run_7z(self, password: str) -> tuple[int, str, str]:
-        """执行 7z 解压单次尝试，返回 (返回码, stdout文本, stderr文本)。"""
+    def _run_7z(self, password: str,
+                overwrite: str = "overwrite") -> tuple[int, str, str]:
+        """执行 7z 解压单次尝试，返回 (返回码, stdout文本, stderr文本)。
+        overwrite: overwrite|skip|rename —— 控制重名文件处理。"""
         if not os.path.isdir(self.dest_dir):
             os.makedirs(self.dest_dir, exist_ok=True)
 
-        # 构建命令行： 7z.exe x -y -p<密码> -o<目标目录> <压缩包>
+        # 构建命令行： 7z.exe x <overwrite> -p<密码> -o<目标目录> <压缩包>
+        # overwrite: "overwrite"->-y(覆盖) "skip"->-aos(跳过已存在) "rename"->-aou(自动改名)
+        ov = {"overwrite": "-y", "skip": "-aos", "rename": "-aou"}.get(overwrite, "-y")
         cmd = [self.seven_zip_path,
-               "x", "-y",
+               "x", ov,
                f"-p{password}",
                f"-o{self.dest_dir}",
                self.archive_path]
@@ -313,6 +320,253 @@ class ZipUnlocker:
             if os.path.isdir(full):
                 self._fix_name_level(full, name_map)
 
+
+    def _collapse_single_dir(self) -> None:
+        """
+        智能解压收缩：若压缩包内所有文件都位于【同一个顶层目录】（且无散文件），
+        则解压后将该顶层目录层折叠掉，内容直接出现在解压目标目录。
+
+        例如 video.zip 内含 video/xxx.mp4 ——
+        解压后目标目录下直接是 xxx.mp4，不再多出 video/ 这一层。
+        若包内存在多个顶层目录或散文件，则保持原样不动。
+        """
+        try:
+            if not os.path.isdir(self.dest_dir):
+                return
+            entries = _zip_central_entries(self.archive_path)
+            if not entries:
+                return
+            # 提取所有条目的顶层路径段（去重）
+            tops = set()
+            for raw_path, _ in entries:
+                proper = raw_path.decode(_detect_name_encoding(raw_path))
+                top = proper.split("/")[0]
+                tops.add(top)
+            if len(tops) != 1:
+                return  # 多顶层/散文件，保留结构
+            top = tops.pop()
+            sub = os.path.join(self.dest_dir, top)
+            if not os.path.isdir(sub):
+                return
+            # 上移该顶层目录的全部内容
+            for name in os.listdir(sub):
+                s = os.path.join(sub, name)
+                d = os.path.join(self.dest_dir, name)
+                if os.path.exists(d):
+                    continue  # 目标重名，跳过避免覆盖
+                try:
+                    shutil.move(s, d)
+                except OSError:
+                    pass
+            # 删除已清空的顶层目录
+            try:
+                if not os.listdir(sub):
+                    os.rmdir(sub)
+            except OSError:
+                pass
+        except Exception:
+            pass  # 收缩失败不影响主流程
+
+    # ------------------------------------------------------------------
+    # 冲突检测
+    # ------------------------------------------------------------------
+    def check_conflicts(self) -> list:
+        """
+        检查解压目标目录中是否已有同名文件/文件夹（可能与压缩包解压结果冲突）。
+        返回冲突的顶层条目名列表；无冲突返回空列表。
+        注意：解压到目标目录后（含智能折叠），顶层冲突项会被覆盖/跳过。
+        """
+        try:
+            if not os.path.isdir(self.dest_dir):
+                return []
+            tops = []
+            ext = os.path.splitext(self.archive_path)[1].lower()
+            zip_like = ext in (".zip", ".jar", ".apk", ".docx", ".xlsx",
+                               ".pptx", ".epub")
+            if zip_like:
+                entries = _zip_central_entries(self.archive_path)
+                for raw_path, _ in entries:
+                    proper = raw_path.decode(
+                        _detect_name_encoding(raw_path))
+                    top = proper.replace("\\", "/").split("/")[0]
+                    if top not in tops:
+                        tops.append(top)
+            else:
+                # 非 zip：解析 7z l -slt
+                cmd = [self.seven_zip_path, "l", "-slt", self.archive_path]
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                    if os.name == "nt" else 0)
+                out_bytes, _ = proc.communicate()
+                text = _decode_bytes(out_bytes)
+                import re
+                first = True
+                for m in re.finditer(r"^Path = (.+)$", text, re.M):
+                    p = m.group(1).strip().replace("\\", "/").lstrip("/")
+                    if not p:
+                        continue
+                    if first:
+                        first = False
+                        continue
+                    top = p.split("/")[0]
+                    if top not in tops:
+                        tops.append(top)
+            return [t for t in tops if os.path.exists(os.path.join(self.dest_dir, t))]
+        except Exception:
+            return []
+
+    # ------------------------------------------------------------------
+    # 解压内容预览
+    # ------------------------------------------------------------------
+    def get_extract_preview(self) -> str:
+        """
+        读取压缩包内容，返回解压后【最终顶层条目】的文字描述，
+        供进度窗口显示"解压出来会得到什么"。
+
+        策略：
+          - ZIP 系（.zip/.jar/.apk 等）：用 _zip_central_entries 读取原始
+            文件名字节，经 _detect_name_encoding 精确解码（正确还原日文/
+            中文），无需依赖 7z 的控制台编码。
+          - 其他格式（rar/7z/tar 等）：解析 `7z l -slt` 的 Path=，用
+            _decode_bytes 兜底解码。
+        再应用“单顶层目录折叠”规则：若包内仅一个顶层目录，则返回该目录
+        内部的文件名（最终会直接散在压缩包旁边）。
+        """
+        try:
+            # ---- ZIP 系：用中央目录原始字节，最精确 ----
+            ext = os.path.splitext(self.archive_path)[1].lower()
+            zip_like = ext in (".zip", ".jar", ".apk", ".docx", ".xlsx",
+                               ".pptx", ".epub")
+            if zip_like:
+                entries = _zip_central_entries(self.archive_path)
+                if entries:
+                    # 顶层段（已按正确编码解码）
+                    tops = []
+                    raw_paths = []
+                    for raw_path, _ in entries:
+                        proper = raw_path.decode(
+                            _detect_name_encoding(raw_path))
+                        p = proper.replace("\\", "/")
+                        top = p.split("/")[0]
+                        if top not in tops:
+                            tops.append(top)
+                        raw_paths.append(p)
+                    return self._preview_fold(tops, raw_paths)
+            # ---- 非 ZIP：解析 7z l -slt 的 Path ----
+            cmd = [self.seven_zip_path, "l", "-slt", self.archive_path]
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW
+                if os.name == "nt" else 0)
+            out_bytes, _ = proc.communicate()
+            text = _decode_bytes(out_bytes)
+            tops = []
+            raw_paths = []
+            import re
+            first = True
+            for m in re.finditer(r"^Path = (.+)$", text, re.M):
+                p = m.group(1).strip().replace("\\", "/").lstrip("/")
+                if not p:
+                    continue
+                if first:
+                    first = False
+                    continue  # 第一个 Path 是压缩包自身路径，跳过
+                top = p.split("/")[0]
+                if top not in tops:
+                    tops.append(top)
+                raw_paths.append(p)
+            return self._preview_told if False else self._preview_fold(tops, raw_paths)
+        except Exception:
+            return ""
+
+    def _preview_fold(self, tops: list, raw_paths: list) -> str:
+        """生成简洁解压内容预览：
+        - 单顶层目录：显示该目录名
+        - 单顶层文件：显示 /文件名
+        - 多个：显示前 3 个 + "等N项" （避免一大串）"""
+        if not tops:
+            return ""
+        # 判断每个顶层是文件还是目录（若存在以 top/ 开头的条目则为目录）
+        is_dir = {}
+        for p in raw_paths:
+            parts = p.split("/")
+            top = parts[0]
+            is_dir.setdefault(top, len(parts) > 1)
+        # 单顶层
+        if len(tops) == 1:
+            top = tops[0]
+            if is_dir.get(top, False):
+                return top          # 单目录：显示目录名
+            return "/" + top        # 单文件：显示 /文件名
+        # 多个顶层
+        shown = "，".join(tops[:3])
+        if len(tops) > 3:
+            shown += f" 等{len(tops)}项"
+        return shown
+
+    # ------------------------------------------------------------------
+    # 分卷删除
+    # ------------------------------------------------------------------    # ------------------------------------------------------------------
+    # 分卷删除
+    # ------------------------------------------------------------------
+    def delete_archive_with_parts(self) -> None:
+        """
+        删除压缩包及其全部分卷文件。
+
+        分卷命名常见三种：
+          - 现代 RAR/7z：  A.part1.rar, A.part2.rar, ...（partN.扩展名）
+          - 7-Zip 分卷：    A.7z.001, A.7z.002, ...（.7z.NNN）
+          - 老式 RAR：      A.rar + A.r00, A.r01, ...（part1 本身是 .rar）
+        解压成功后删除源文件时调用，避免只删触发分卷而残留其他分卷。
+        """
+        try:
+            d = os.path.dirname(os.path.abspath(self.archive_path))
+            if not os.path.isdir(d):
+                return
+            base = os.path.basename(self.archive_path)
+            patterns = []
+
+            # 1) A.partN.ext （part + 数字 + 扩展名）
+            m = re.match(r"^(.*\.part)\d+(\.[^.]+)$", base)
+            if m:
+                prefix, ext = m.group(1), m.group(2)
+                patterns.append(re.compile(
+                    "^" + re.escape(prefix) + r"\d+" + re.escape(ext) + "$"))
+
+            # 2) A.7z.NNN  （.7z. + 数字）
+            m2 = re.match(r"^(.*\.7z\.)\d+$", base)
+            if m2:
+                prefix = m2.group(1)
+                patterns.append(re.compile("^" + re.escape(prefix) + r"\d+$"))
+
+            # 3) 老式 RAR：A.rar + A.r00 分卷（part1 本身是 .rar）
+            m3 = re.match(r"^(.*)\.rar$", base)
+            if m3:
+                stem = m3.group(1)
+                if os.path.exists(os.path.join(d, stem + ".r00")):
+                    patterns.append(re.compile(
+                        "^" + re.escape(stem) + r"\.r\d+$"))
+                    patterns.append(re.compile("^" + re.escape(stem) + r"\.rar$"))
+
+            # 匹配到任何模式的同组文件全部删除
+            removed = []
+            for name in os.listdir(d):
+                if any(p.match(name) for p in patterns):
+                    try:
+                        os.remove(os.path.join(d, name))
+                        removed.append(name)
+                    except OSError:
+                        pass
+            # 一个分卷模式都没匹配到时，退化为删除自身
+            if not removed:
+                try:
+                    os.remove(self.archive_path)
+                except OSError:
+                    pass
+        except Exception:
+            pass  # 删除失败不影响主流程
+
     # ------------------------------------------------------------------
     # 日志
     # ------------------------------------------------------------------
@@ -382,19 +636,54 @@ def _decode_bytes(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+# GBK 误读 Shift-JIS 数据时常见的“乱码特征字”（生僻/罕用，几乎不会出现在真实文件名）
+_MOJIBAKE_HANZI = set(
+    "戞榖怴斣慻僼僅儖僟掞摎搤摯撉撏撉揱揹擯攃攄攞攠攡攣攦"
+    "攩攪攭攮攱攲攳攴攵攷攺攼攽政扂扃扄扆"
+)
+
+
 def _detect_name_encoding(raw: bytes) -> str:
-    """探测 ZIP 文件名字节的最佳解码编码：UTF-8 → Shift-JIS → GBK。"""
+    """
+    探测 ZIP 文件名字节的最佳解码编码。
+
+    GBK 与 Shift-JIS 都是宽松双字节编码，单凭字节合法性无法可靠区分。
+    采用“乱码特征”双向启发式：
+      - UTF-8 严格解码成功且含非 ASCII → utf-8
+      - 半角片假名（U+FF65..FF9F）出现 → SJIS 误读 GBK 数据的特征 → gbk
+      - “乱码特征字”出现（GBK 误读 SJIS 数据的生僻字产物）→ shift_jis
+      - 否则按中文字符占比回退 gbk
+    """
     try:
-        raw.decode("utf-8")
-        return "utf-8"
+        dec = raw.decode("utf-8")
+        if any(ord(c) > 127 for c in dec):
+            return "utf-8"
     except UnicodeDecodeError:
         pass
+
     try:
-        raw.decode("shift_jis")
+        g = raw.decode("gbk")
+    except UnicodeDecodeError:
+        g = None
+    try:
+        s = raw.decode("shift_jis")
+    except UnicodeDecodeError:
+        s = None
+    if g is None and s is None:
+        return "gbk"
+
+    # 强信号：半角片假名（SJIS 误读 GBK 字节的特征）
+    if g is not None and any(0xFF65 <= ord(c) <= 0xFF9F for c in g):
+        return "gbk"
+    # 强信号：乱码特征字（GBK 误读 SJIS 字节的生僻字产物）
+    if g is not None and any(c in _MOJIBAKE_HANZI for c in g):
         return "shift_jis"
-    except UnicodeDecodeError:
-        pass
-    return "gbk"
+    if g is not None and s is not None:
+        # 弱信号：中文常用字占比
+        han_g = sum(1 for c in g if 0x4E00 <= ord(c) <= 0x9FA5)
+        han_s = sum(1 for c in s if 0x4E00 <= ord(c) <= 0x9FA5)
+        return "gbk" if han_g >= han_s else "shift_jis"
+    return "gbk" if g is not None else "shift_jis"
 
 
 def _zip_central_entries(path: str) -> list:

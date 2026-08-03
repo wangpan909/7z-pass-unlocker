@@ -172,8 +172,8 @@ class App:
 
         if self._launch_archive:
             self.var_archive.set(self._launch_archive)
-            base, _ = os.path.splitext(self._launch_archive)
-            self.var_dest.set(base)
+            # 解压到压缩包所在目录（不额外建文件夹）
+            self.var_dest.set(os.path.dirname(self._launch_archive))
             self._log(f"已载入压缩包：{self._launch_archive}")
             self._log("请导入或输入密码单，然后点击「开始尝试」。")
 
@@ -275,8 +275,7 @@ class App:
         if path:
             self.var_archive.set(path)
             # 默认解压目录：压缩包同名 + "_解压"
-            base, _ = os.path.splitext(path)
-            self.var_dest.set(base)
+            self.var_dest.set(os.path.dirname(path))
 
     def _browse_7z(self) -> None:
         path = filedialog.askopenfilename(
@@ -360,9 +359,8 @@ class App:
             messagebox.showwarning(APP_TITLE, "7z.exe 路径无效，请指定或自动检测。")
             return
         if not dest:
-            # 默认：压缩包所在目录，同名解压
-            base, _ = os.path.splitext(archive)
-            dest = base
+            # 默认：解压到压缩包所在目录（不额外建文件夹）
+            dest = os.path.dirname(archive)
             self.var_dest.set(dest)
 
         passwords = self._normalize_passwords(
@@ -547,18 +545,46 @@ def _cli_action(action: str) -> int:
 
 def _auto_unlock(archive_path: str) -> None:
     """
-    静默一键解压（右键菜单调用）：
-      - 隐藏窗口，后台用默认密码单自动尝试密码
-      - 成功：无任何提示，删除源压缩包，退出
-      - 失败：弹窗提示“未找到正确密码”，退出
+    一键解压（右键菜单调用）：
+      - 显示精简进度窗口（压缩包名 + 进度条 + 尝试计数）
+      - 成功：进度条跑完，窗口自动消失，删除源压缩包，无弹窗
+      - 失败：进度条停止，弹窗提示“未找到正确密码”，窗口关闭
     """
     root = tk.Tk()
-    root.withdraw()  # 隐藏主窗口
+    root.title("7z密码单解压助手 — 解压中")
+    root.geometry("440x180")
+    root.resizable(False, False)
+    # 居中显示
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() - 440) // 2
+    y = (root.winfo_screenheight() - 180) // 2
+    root.geometry(f"+{x}+{y}")
+    root.attributes("-topmost", True)  # 置顶，避免被其他窗口挡住
+
+    # 控件
+    frame = ttk.Frame(root, padding=12)
+    frame.pack(fill="both", expand=True)
+    ttk.Label(frame, text="正在解压：", anchor="w").pack(fill="x")
+    lbl_file = ttk.Label(frame, text=os.path.basename(archive_path),
+                         anchor="w", font=("Microsoft YaHei", 10))
+    lbl_file.pack(fill="x", pady=(0, 4))
+    # 解压内容预览（解压出来会得到什么）
+    lbl_content = ttk.Label(frame, text="解压内容：读取中...",
+                            anchor="w", font=("Microsoft YaHei", 9),
+                            foreground="#555555", wraplength=420)
+    lbl_content.pack(fill="x", pady=(0, 6))
+    self_progress = ttk.Progressbar(frame, maximum=100, mode="determinate")
+    self_progress.pack(fill="x", pady=4)
+    lbl_status = ttk.Label(frame, text="准备中...", anchor="w")
+    lbl_status.pack(fill="x")
+
+    # UI 更新队列（后台线程 -> 主线程）
+    ui_queue: queue.Queue = queue.Queue()
 
     seven = ZipUnlocker.find_7z()
     if not seven:
-        messagebox.showerror(APP_TITLE, "未找到 7z.exe，无法解压。")
         root.destroy()
+        messagebox.showerror(APP_TITLE, "未找到 7z.exe，无法解压。")
         return
 
     pw_path = get_default_password_file()
@@ -567,43 +593,97 @@ def _auto_unlock(archive_path: str) -> None:
     except Exception as e:  # noqa: BLE001
         passwords = []
     if not passwords:
+        root.destroy()
         messagebox.showwarning(
             APP_TITLE,
             "默认密码单为空，无法自动尝试。\n\n"
             f"请先打开本程序，在密码单中输入密码后点「保存密码单」。\n"
             f"（{pw_path}）")
-        root.destroy()
         return
 
-    base, _ = os.path.splitext(archive_path)
-    dest = base  # 解压到原文件名目录
+    dest = os.path.dirname(archive_path)  # 解压到压缩包所在目录，不额外建文件夹
     u = ZipUnlocker(seven, archive_path, dest)
+
+    def progress_cb(index: int, total: int, password: str,
+                    status: str, detail: str, elapsed_ms: int) -> None:
+        ui_queue.put(("progress", (index, total, password, status, detail)))
+
+    # 解压前检查重名冲突，询问用户如何处理
+    overwrite = "overwrite"
+    try:
+        conflicts = u.check_conflicts()
+    except Exception:
+        conflicts = []
+    if conflicts:
+        shown = "、".join(conflicts[:5]) + (" 等" if len(conflicts) > 5 else "")
+        choice = messagebox.askyesnocancel(
+            APP_TITLE,
+            f"目标目录已存在同名文件/文件夹：\n{shown}\n\n"
+            f"共 {len(conflicts)} 个。\n\n"
+            "「是」= 覆盖现有文件\n「否」= 跳过重名文件，解压其余\n"
+            "「取消」= 中止本次解压")
+        if choice is None:
+            root.destroy()
+            return
+        overwrite = "overwrite" if choice else "skip"
 
     def worker() -> None:
         try:
-            result = u.try_passwords(passwords)
+            result = u.try_passwords(passwords, progress_cb=progress_cb,
+                                     overwrite=overwrite)
         except Exception as e:  # noqa: BLE001
             result = {"success": False, "password": None,
                       "attempted": 0, "total": len(passwords),
                       "errors": [str(e)]}
-        root.after(0, lambda: _finish(result))
+        ui_queue.put(("done", result))
+
+    def _poll_queue() -> None:
+        try:
+            while True:
+                kind, payload = ui_queue.get_nowait()
+                if kind == "progress":
+                    index, total, password, status, detail = payload
+                    if status == "running":
+                        lbl_status.config(text=f"正在尝试 {index}/{total}：{password}")
+                        self_progress["maximum"] = total
+                        self_progress["value"] = max(index - 1, 0)
+                    else:
+                        lbl_status.config(
+                            text=f"已尝试 {index}/{total}：{password} → {detail}")
+                        self_progress["value"] = index
+                elif kind == "done":
+                    _finish(payload)
+        except queue.Empty:
+            pass
+        root.after(80, _poll_queue)
 
     def _finish(result) -> None:
         if result["success"]:
-            # 成功：删除源压缩包，静默退出
-            try:
-                os.remove(archive_path)
-            except OSError:
-                pass
+            # 成功：进度条满格，删除源压缩包（含分卷），窗口自动消失（无弹窗）
+            self_progress["value"] = self_progress["maximum"]
+            lbl_status.config(text="解压完成")
+            root.update_idletasks()
+            u.delete_archive_with_parts()  # 删除压缩包及全部分卷
             root.destroy()
         else:
             msg = (f"未能解压：{os.path.basename(archive_path)}\n\n"
                    f"已尝试 {result['attempted']} 个密码，均不正确或解压失败。\n"
                    f"可打开本程序，补充密码后点「保存密码单」再试。")
-            messagebox.showwarning(APP_TITLE, msg)
             root.destroy()
+            messagebox.showwarning(APP_TITLE, msg)
+
+    # 提前读取解压内容预览并填充（解压出来会得到什么）
+    try:
+        preview = u.get_extract_preview()
+        if preview:
+            lbl_content.config(text=f"解压内容：{preview}")
+        else:
+            lbl_content.config(text="解压内容：—")
+    except Exception:
+        lbl_content.config(text="解压内容：—")
 
     threading.Thread(target=worker, daemon=True).start()
+    root.after(80, _poll_queue)
     root.mainloop()
 
 
