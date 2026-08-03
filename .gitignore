@@ -21,3 +21,7 @@ _genkey.sh
 _sshtest*
 _patch*.py
 _*.py
+
+# 中文编码测试数据
+_中文测试/
+_*测试*/

@@ -167,6 +167,8 @@ class ZipUnlocker:
             if self._is_success(returncode, out_text, err_text):
                 result["success"] = True
                 result["password"] = pwd
+                # 修复因文件名编码导致的乱码（SJIS/GBK 无 UTF-8 标志的 ZIP）
+                self._fix_filename_encoding()
                 if progress_cb:
                     progress_cb(idx + 1, total, pwd, "success",
                                 "解压成功！", elapsed_ms)
@@ -247,6 +249,71 @@ class ZipUnlocker:
         return "解压失败"
 
     # ------------------------------------------------------------------
+    # 文件名编码修复（动画/日文资源包常见问题）
+    # ------------------------------------------------------------------
+    def _fix_filename_encoding(self) -> None:
+        """
+        修复因文件名编码导致的乱码（仅对 ZIP 系容器）。
+
+        问题来源：部分 ZIP（尤其日文/动画资源包）文件名记录的是 Shift-JIS
+        或 UTF-8 字节，但通用标志位未置 UTF-8 位（0x0800），7-Zip 会按系统
+        本地代码页（中文系统为 GBK）误读，导致解出的文件/文件夹名乱码。
+
+        解决：读取 ZIP 中央目录中的原始文件名字节，自动探测编码
+        （UTF-8 → Shift-JIS → GBK），建立“乱码名 → 正确名”映射，
+        然后递归逐层重命名（先目录后文件，目录修复后继续进入处理）。
+        """
+        try:
+            ext = os.path.splitext(self.archive_path)[1].lower()
+            if ext not in (".zip", ".jar", ".apk", ".docx", ".xlsx",
+                           ".pptx", ".epub"):
+                return
+            if not os.path.isdir(self.dest_dir):
+                return
+            entries = _zip_central_entries(self.archive_path)
+            if not entries:
+                return
+            # 建立单层名称映射：GBK误读名 -> 正确名（目录/文件各层组件）
+            name_map = {}
+            for raw_path, raw in entries:
+                mangled_path = raw_path.decode("gbk", errors="replace")
+                proper_path = raw_path.decode(_detect_name_encoding(raw_path))
+                if mangled_path == proper_path:
+                    continue
+                m_parts = mangled_path.split("/")
+                p_parts = proper_path.split("/")
+                for mp, pp in zip(m_parts, p_parts):
+                    if mp and mp != pp:
+                        name_map[mp] = pp
+            if not name_map:
+                return
+            self._fix_name_level(self.dest_dir, name_map)
+        except Exception:
+            pass  # 修复失败不影响主流程
+
+    def _fix_name_level(self, d: str, name_map: dict) -> None:
+        """递归修复一层目录：先重命名本层乱码项，再进入子目录递归。"""
+        try:
+            names = os.listdir(d)
+        except OSError:
+            return
+        for entry in names:
+            full = os.path.join(d, entry)
+            new_name = name_map.get(entry)
+            if new_name and new_name != entry:
+                dst = os.path.join(d, new_name)
+                if not os.path.exists(dst):
+                    try:
+                        os.rename(full, dst)
+                        entry = new_name
+                        full = os.path.join(d, entry)
+                    except OSError:
+                        pass
+            # 进入子目录继续修复（目录可能刚被重命名）
+            if os.path.isdir(full):
+                self._fix_name_level(full, name_map)
+
+    # ------------------------------------------------------------------
     # 日志
     # ------------------------------------------------------------------
     def write_log(self, result: dict) -> str:
@@ -313,6 +380,49 @@ def _decode_bytes(data: bytes) -> str:
         except (UnicodeDecodeError, LookupError):
             continue
     return data.decode("utf-8", errors="replace")
+
+
+def _detect_name_encoding(raw: bytes) -> str:
+    """探测 ZIP 文件名字节的最佳解码编码：UTF-8 → Shift-JIS → GBK。"""
+    try:
+        raw.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        pass
+    try:
+        raw.decode("shift_jis")
+        return "shift_jis"
+    except UnicodeDecodeError:
+        pass
+    return "gbk"
+
+
+def _zip_central_entries(path: str) -> list:
+    """
+    读取 ZIP 中央目录，返回 [(相对路径, 原始文件名字节), ...]。
+    适用于 ZIP 系容器（zip/jar/apk/docx/xlsx/pptx/epub 均为 ZIP 结构）。
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return []
+    entries = []
+    i = 0
+    while True:
+        i = data.find(b"PK\x01\x02", i)
+        if i < 0:
+            break
+        # 中央目录头固定 46 字节；文件名长度在 offset 28（2字节）
+        nlen = int.from_bytes(data[i + 28:i + 30], "little")
+        elen = int.from_bytes(data[i + 30:i + 32], "little")
+        clen = int.from_bytes(data[i + 32:i + 34], "little")
+        fn = data[i + 46:i + 46 + nlen]
+        # 跳过目录条目（以 / 结尾）与空名
+        if fn and not fn.endswith(b"/"):
+            entries.append((fn, fn))
+        i += 46 + nlen + elen + clen
+    return entries
 
 
 def load_password_list(file_path: str) -> list[str]:
