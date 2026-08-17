@@ -28,3 +28,6 @@ _*测试*/
 
 # 输入法误生成的字面量 SystemDrive 目录
 %SystemDrive%/
+
+# opencode 本地会话/计划目录
+.omo/
