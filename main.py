@@ -476,11 +476,14 @@ class App:
         else:
             self._log("")
             self._log(f"全部失败，共尝试 {result['attempted']} 个密码。")
+            if result.get("last_detail"):
+                self._log(f"最后失败原因：{result['last_detail']}")
             self.lbl_status.config(text="解压失败：未找到正确密码")
+            detail = f"\n最后失败原因：{result['last_detail']}" if result.get("last_detail") else ""
             messagebox.showwarning(
                 APP_TITLE,
-                f"未找到正确密码。\n\n已尝试：{result['attempted']} / "
-                f"{result['total']} 个密码")
+                f"未能解压。\n\n已尝试：{result['attempted']} / "
+                f"{result['total']} 个密码{detail}")
 
     # ------------------------------------------------------------------
     # 日志输出（只读区域）
@@ -666,8 +669,11 @@ def _auto_unlock(archive_path: str) -> None:
             u.delete_archive_with_parts()  # 删除压缩包及全部分卷
             root.destroy()
         else:
+            detail = ""
+            if result.get("last_detail"):
+                detail = f"\n最后失败原因：{result['last_detail']}"
             msg = (f"未能解压：{os.path.basename(archive_path)}\n\n"
-                   f"已尝试 {result['attempted']} 个密码，均不正确或解压失败。\n"
+                   f"已尝试 {result['attempted']} 个密码。{detail}\n"
                    f"可打开本程序，补充密码后点「保存密码单」再试。")
             root.destroy()
             messagebox.showwarning(APP_TITLE, msg)

@@ -20,7 +20,9 @@ unlocker.py — 7z 密码表自动解压核心逻辑（纯逻辑，无 GUI 依�
 import os
 import re
 import shutil
+import struct
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -75,6 +77,12 @@ class ZipUnlocker:
         self.dest_dir = dest_dir
         self._current_process: subprocess.Popen | None = None
         self._process_lock = threading.Lock()
+        # 伪装识别：内嵌 zip 剥离出的临时文件路径（找到前为 None）
+        self._embedded_zip_path: str | None = None
+        # 本次运行产生的临时文件（剥离的 zip / -P 密码文件），结束清理
+        self._temp_files: list[str] = []
+        # -P 密码文件支持（按 7z 主版本号 24+ 检测），None=尚未检测
+        self._supports_pfile: bool | None = None
 
     # ------------------------------------------------------------------
     # 静态方法：自动检测 7z
@@ -142,47 +150,54 @@ class ZipUnlocker:
             "attempted": 0,
             "total": total,
             "errors": [],
+            "last_detail": "",  # 最后一次失败的细分原因（密码错误/不是压缩包等）
         }
         if total == 0:
             result["errors"].append("密码列表为空")
             return result
 
-        for idx, pwd in enumerate(passwords):
-            # 检查取消信号
-            if cancel_event is not None and cancel_event.is_set():
-                result["errors"].append("用户取消")
-                break
+        try:
+            for idx, pwd in enumerate(passwords):
+                # 检查取消信号
+                if cancel_event is not None and cancel_event.is_set():
+                    result["errors"].append("用户取消")
+                    break
 
-            result["attempted"] = idx + 1
-            start = time.perf_counter()
+                result["attempted"] = idx + 1
+                start = time.perf_counter()
 
-            if progress_cb:
-                progress_cb(idx + 1, total, pwd, "running", "正在尝试...", 0)
-
-            # 执行解压
-            returncode, out_text, err_text = self._run_7z(pwd, overwrite=overwrite)
-
-            elapsed_ms = int((time.perf_counter() - start) * 1000)
-
-            # 判定成功 / 失败
-            if self._is_success(returncode, out_text, err_text):
-                result["success"] = True
-                result["password"] = pwd
-                # 修复因文件名编码导致的乱码（SJIS/GBK 无 UTF-8 标志的 ZIP）
-                self._fix_filename_encoding()
-                # 智能收缩：包内仅一个顶层目录时不再额外套一层（类似 Bandizip 智能解压）
-                self._collapse_single_dir()
                 if progress_cb:
-                    progress_cb(idx + 1, total, pwd, "success",
-                                "解压成功！", elapsed_ms)
-                break
-            else:
-                detail = self._failure_reason(out_text, err_text)
-                if progress_cb:
-                    progress_cb(idx + 1, total, pwd, "failed",
-                                detail, elapsed_ms)
-        else:
-            # for-else：未 break 且未中途取消，说明全部失败
+                    progress_cb(idx + 1, total, pwd, "running", "正在尝试...", 0)
+
+                # 执行解压
+                returncode, out_text, err_text = self._run_7z(pwd, overwrite=overwrite)
+
+                elapsed_ms = int((time.perf_counter() - start) * 1000)
+
+                # 判定成功 / 失败
+                if self._is_success(returncode, out_text, err_text):
+                    result["success"] = True
+                    result["password"] = pwd
+                    # 修复因文件名编码导致的乱码（SJIS/GBK 无 UTF-8 标志的 ZIP）
+                    self._fix_filename_encoding()
+                    # 智能收缩：包内仅一个顶层目录时不再额外套一层（类似 Bandizip 智能解压）
+                    self._collapse_single_dir()
+                    if progress_cb:
+                        progress_cb(idx + 1, total, pwd, "success",
+                                    "解压成功！", elapsed_ms)
+                    break
+                else:
+                    detail = self._failure_reason(out_text, err_text)
+                    result["last_detail"] = detail
+                    if progress_cb:
+                        progress_cb(idx + 1, total, pwd, "failed",
+                                    detail, elapsed_ms)
+        finally:
+            # 无论成功/失败/取消，清理剥离的伪装 zip 与 -P 密码临时文件
+            self._cleanup_temp_files()
+
+        if not result["success"]:
+            # for-else 替代：未 break 且未中途取消，说明全部失败
             if cancel_event is None or not cancel_event.is_set():
                 result["success"] = False
 
@@ -194,19 +209,57 @@ class ZipUnlocker:
     def _run_7z(self, password: str,
                 overwrite: str = "overwrite") -> tuple[int, str, str]:
         """执行 7z 解压单次尝试，返回 (返回码, stdout文本, stderr文本)。
-        overwrite: overwrite|skip|rename —— 控制重名文件处理。"""
+        overwrite: overwrite|skip|rename —— 控制重名文件处理。
+
+        两项增强：
+          1. 密码含非 ASCII 字符时依次尝试两种形态：
+             - 先 -P 密码文件（7-Zip 24+，按 UTF-8 读取，标准 Unicode 形态）
+             - 再 -p 命令行形态（创建端若经历了系统代码页转换，存储的
+               是 CLI 形态）
+             实测确认：7z.exe 的命令行 -p 传非 ASCII 密码不稳定，同一
+             命令创建的包有时存标准形态、有时存代码页转换形态，两种
+             形态互相对不上——这就是中文/日文密码"同样密码有时行有时
+             不行"的根源。两种形态都试，必中其一。
+          2. 7z 报"打不开/不是压缩包"时，自动识别内嵌 zip（视频伪装
+             包等双形态文件），剥离前置数据到临时文件后重试。
+        """
         if not os.path.isdir(self.dest_dir):
             os.makedirs(self.dest_dir, exist_ok=True)
 
-        # 构建命令行： 7z.exe x <overwrite> -p<密码> -o<目标目录> <压缩包>
+        # 当前应操作的压缩包路径：已识别内嵌 zip 时用剥离出的临时文件
+        archive = self._embedded_zip_path or self.archive_path
+
+        # 构建命令行： 7z.exe x <overwrite> <密码参数> -o<目标目录> <压缩包>
         # overwrite: "overwrite"->-y(覆盖) "skip"->-aos(跳过已存在) "rename"->-aou(自动改名)
         ov = {"overwrite": "-y", "skip": "-aos", "rename": "-aou"}.get(overwrite, "-y")
-        cmd = [self.seven_zip_path,
-               "x", ov,
-               f"-p{password}",
-               f"-o{self.dest_dir}",
-               self.archive_path]
 
+        rc, out_text, err_text = -1, "", ""
+        for pw_arg in self._password_attempts(password):
+            cmd = [self.seven_zip_path,
+                   "x", ov,
+                   pw_arg,
+                   f"-o{self.dest_dir}",
+                   archive]
+            rc, out_text, err_text = self._invoke(cmd)
+            if rc == 0:
+                break
+
+            # 失败且尚未识别出内嵌 zip → 尝试一次伪装剥离重试
+            if (self._embedded_zip_path is None
+                    and _looks_like_not_archive(out_text + "\n" + err_text)):
+                base = _locate_embedded_zip(self.archive_path)
+                if base:
+                    self._embedded_zip_path = self._strip_embedded_zip(base)
+                    archive = self._embedded_zip_path
+                    cmd[5] = archive
+                    rc, out_text, err_text = self._invoke(cmd)
+                    if rc == 0:
+                        break
+
+        return rc, out_text, err_text
+
+    def _invoke(self, cmd: list[str]) -> tuple[int, str, str]:
+        """执行 7z 子进程并解码输出，返回 (返回码, stdout文本, stderr文本)。"""
         creationflags = 0
         if os.name == "nt":
             creationflags = subprocess.CREATE_NO_WINDOW  # 避免弹黑窗
@@ -230,9 +283,85 @@ class ZipUnlocker:
                 self._current_process = None
 
         # 解码：7z 输出可能是 GBK，统一用 utf-8 尝试，失败回退 GBK
-        out_text = _decode_bytes(out_bytes)
-        err_text = _decode_bytes(err_bytes)
-        return proc.returncode, out_text, err_text
+        return proc.returncode, _decode_bytes(out_bytes), _decode_bytes(err_bytes)
+
+    # ------------------------------------------------------------------
+    # 密码传参 / 内嵌 zip 辅助
+    # ------------------------------------------------------------------
+    def _password_attempts(self, password: str) -> list[str]:
+        """
+        返回本次密码需要依次尝试的 7z 密码参数列表。
+
+        纯 ASCII 密码：仅 -p<密码>（命令行传参对 ASCII 无损，所有版本可用）。
+        含非 ASCII 密码（中文/日文等）：
+          - 先 -P<临时文件>（7-Zip 24.00+）：按 UTF-8 从文件读取，得到
+            标准 Unicode 形态，与 7-Zip GUI / Bandizip / WinRAR 等
+            常规工具存储的密码一致；
+          - 再 -p<密码> 命令行形态：若创建端（如某命令行脚本）经过了
+            系统代码页转换，包内存储的是 CLI 形态。
+        两种形态都尝试，兼容两类来源的压缩包。
+        """
+        if any(ord(c) > 127 for c in password):
+            args = []
+            if self._pfile_supported():
+                args.append(self._password_arg(password, use_pfile=True))
+            args.append(self._password_arg(password, use_pfile=False))
+            return args
+        return [self._password_arg(password, use_pfile=False)]
+
+    def _password_arg(self, password: str, use_pfile: bool = False) -> str:
+        """
+        构建单个 7z 密码参数。
+        use_pfile=True：写临时密码文件（UTF-8，每行一个）改用 -P<文件>；
+        use_pfile=False：直接 -p<密码>。
+        临时文件在 try_passwords 结束时统一清理。
+        """
+        if use_pfile:
+            fd, path = tempfile.mkstemp(prefix="pw_", suffix=".txt")
+            with os.fdopen(fd, "wb") as f:
+                f.write(password.encode("utf-8"))
+                f.write(b"\n")
+            self._temp_files.append(path)
+            return f"-P{path}"
+        return f"-p{password}"
+
+    def _pfile_supported(self) -> bool:
+        """检测 7-Zip 是否支持 -P 密码文件（24.00 起支持），结果缓存。"""
+        if self._supports_pfile is None:
+            try:
+                proc = subprocess.Popen(
+                    [self.seven_zip_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                    if os.name == "nt" else 0)
+                out, _ = proc.communicate(timeout=5)
+                m = re.search(r"7-Zip (\d+)\.(\d+)", _decode_bytes(out))
+                ver = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+                self._supports_pfile = ver >= (24, 0)
+            except Exception:
+                self._supports_pfile = False
+        return self._supports_pfile
+
+    def _strip_embedded_zip(self, base: int) -> str:
+        """把 archive_path 从偏移 base 起的内容复制为临时 zip 文件，返回其路径。"""
+        fd, tmp_path = tempfile.mkstemp(prefix="7zunlock_embedded_", suffix=".zip")
+        with os.fdopen(fd, "wb") as out:
+            with open(self.archive_path, "rb") as src:
+                src.seek(base)
+                shutil.copyfileobj(src, out, 8 * 1024 * 1024)
+        self._temp_files.append(tmp_path)
+        return tmp_path
+
+    def _cleanup_temp_files(self) -> None:
+        """清理本次运行产生的临时文件（剥离的 zip 与 -P 密码文件）。"""
+        for p in self._temp_files:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        self._temp_files.clear()
+        self._embedded_zip_path = None
 
     # ------------------------------------------------------------------
     # 结果判定
@@ -251,6 +380,9 @@ class ZipUnlocker:
             return "密码错误"
         if "can not open encrypted archive" in combined or "无法打开加密的档案" in combined:
             return "无法打开加密档案"
+        if _looks_like_not_archive(combined):
+            # 走到这里说明连内嵌 zip 识别也失败了（正常 zip 剥离重试会成功）
+            return "文件不是压缩包（或伪装的视频/图片中未发现内嵌压缩包）"
         if not os.path.isfile(self.archive_path):
             return "压缩包不存在"
         return "解压失败"
@@ -625,15 +757,82 @@ def _find_7z_in_path_win() -> str | None:
 
 
 def _decode_bytes(data: bytes) -> str:
-    """将 7z 输出字节解码为文本，优先 UTF-8，失败回退 GBK，再失败用 errors='replace'。"""
+    """将字节解码为文本：
+    - 带 BOM 的 UTF-16（记事本"Unicode"保存）→ utf-16-le/be
+    - 否则优先 UTF-8，失败回退 GBK，再失败用 errors='replace'。
+    """
     if data is None:
         return ""
+    if data[:2] == b"\xff\xfe":
+        return data.decode("utf-16-le", errors="replace")
+    if data[:2] == b"\xfe\xff":
+        return data.decode("utf-16-be", errors="replace")
     for enc in ("utf-8", "gbk"):
         try:
             return data.decode(enc)
         except (UnicodeDecodeError, LookupError):
             continue
     return data.decode("utf-8", errors="replace")
+
+
+# 7z 报错特征：文件能被读取但无法作为压缩包打开
+_NOT_ARCHIVE_PATTERNS = (
+    "is not archive",
+    "not an archive",
+    "cannot open the file as",
+    "can't open as archive",
+)
+
+
+def _looks_like_not_archive(text: str) -> bool:
+    """判断 7z 输出是否属于"这不是压缩包"类错误。"""
+    low = text.lower()
+    return any(p in low for p in _NOT_ARCHIVE_PATTERNS)
+
+
+def _locate_embedded_zip(path: str) -> int | None:
+    """
+    在文件中定位"内嵌 zip"的起点偏移，未发现返回 None。
+
+    背景：资源圈常见的"双形态文件"（如视频伪装包）在文件开头放了
+    与 zip 无关的前置数据（MP4 视频等），真正的 zip 结构从某个偏移
+    处才开始。zip 的"真身"由文件尾部的 EOCD（PK\\x05\\x06）记录
+    中央目录尺寸与位置，据此反推 zip 起点。
+
+    判定条件（全部满足才算命中的内嵌 zip）：
+      1. 尾部 1MB 内找到 EOCD（含长注释的情况也覆盖）；
+      2. 反推起点 zip_base = eocd_abs - cd_size - cd_offset > 0；
+      3. zip_base 处确实是本地文件头 PK\\x03\\x04。
+
+    普通 zip（无前置数据）zip_base 为 0，返回 None。
+    """
+    try:
+        size = os.path.getsize(path)
+        if size < 22:
+            return None
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 1_000_000))
+            tail = f.read()
+        i = tail.rfind(b"PK\x05\x06")
+        if i < 0:
+            return None
+        if len(tail) - i < 22:
+            return None
+        (sig, disc, cd_disc, n_disc, n_total,
+         cd_size, cd_offset, clen) = struct.unpack("<4sHHHHIIH", tail[i:i + 22])
+        if cd_size <= 0 or cd_offset <= 0:
+            return None
+        eocd_abs = size - len(tail) + i
+        zip_base = eocd_abs - cd_size - cd_offset
+        if zip_base <= 0 or zip_base + 4 > size:
+            return None
+        with open(path, "rb") as f:
+            f.seek(zip_base)
+            if f.read(4) != b"PK\x03\x04":
+                return None
+        return zip_base
+    except (OSError, struct.error, ValueError):
+        return None
 
 
 # GBK 误读 Shift-JIS 数据时常见的“乱码特征字”（生僻/罕用，几乎不会出现在真实文件名）
